@@ -8,12 +8,14 @@ from __future__ import annotations
 import numpy as np
 import torch
 import trimesh
-from typing import TYPE_CHECKING
-
+from typing import TYPE_CHECKING, Tuple
+import os
 import warp
 from pxr import UsdGeom
 
 import omni.isaac.lab.sim as sim_utils
+import omni.isaac.core.utils.prims as prim_utils
+
 from omni.isaac.lab.markers import VisualizationMarkers
 from omni.isaac.lab.markers.config import FRAME_MARKER_CFG
 from omni.isaac.lab.utils.warp import convert_to_warp_mesh
@@ -21,6 +23,9 @@ from omni.isaac.lab.utils.warp import convert_to_warp_mesh
 from .terrain_generator import TerrainGenerator
 from .trimesh.utils import make_plane
 from .utils import create_prim_from_mesh
+from .height_field.utils import convert_height_field_to_mesh
+# from .map_generator import height_field_to_mesh
+
 
 if TYPE_CHECKING:
     from .terrain_importer_cfg import TerrainImporterCfg
@@ -104,6 +109,30 @@ class TerrainImporter:
             self.import_ground_plane("terrain")
             # configure the origins in a grid
             self.configure_env_origins()
+        elif self.cfg.terrain_type == "height_field":
+            # check if config is provided
+            if self.cfg.ground_folder is None or self.cfg.ceiling_folder is None:
+                raise ValueError("Input terrain type is 'height_field' but no value provided for 'height_field_folder'.")
+            # import the height field terrain
+            self.import_height_field_folder(self.cfg.ground_folder, self.cfg.ceiling_folder, self.cfg.grid_size, self.cfg.terrain_size)
+            # configure_env_origins is called within import_height_field_folder
+        # write elif for constrained space
+        elif self.cfg.terrain_type == "constrained_space":
+            # check if config is provided
+            if self.cfg.ground_folder is None or self.cfg.ceiling_folder is None:
+                raise ValueError("Input terrain type is 'constrained_space' but no value provided for 'ground_folder' or 'ceiling_folder'.")
+            # import the constrained space terrain
+            self.import_constrained_space(self.cfg.ground_folder, self.cfg.ceiling_folder, self.cfg.grid_size, self.cfg.terrain_size, self.cfg.ceiling_height)
+            # configure_env_origins is called within import_constrained_space
+        elif self.cfg.terrain_type == "f1tenth":
+            # check if config is provided
+            if self.cfg.map_folder is None:
+                raise ValueError("Input terrain type is 'f1tenth' but no value provided for 'map_folder'.")
+            # import the F1TENTH maps
+            self.import_f1tenth_maps(self.cfg.map_folder, self.cfg.grid_size, self.cfg.terrain_size)
+            # configure_env_origins is called within import_f1tenth_maps
+
+
         else:
             raise ValueError(f"Terrain type '{self.cfg.terrain_type}' not available.")
 
@@ -360,3 +389,489 @@ class TerrainImporter:
         env_origins[:, 1] = (jj.flatten()[:num_envs] - (num_cols - 1) / 2) * env_spacing
         env_origins[:, 2] = 0.0
         return env_origins
+
+    def import_constrained_space(self, ground_folder: str, ceiling_folder: str, grid_size: Tuple[int, int], terrain_size: Tuple[float, float], ceiling_height: float):
+        """
+        Import height field .npy files for both ground and ceiling, convert them to terrain meshes,
+        and arrange them in a grid to create a constrained space.
+
+        Args:
+            ground_folder (str): Path to the folder containing ground height field .npy files.
+            ceiling_folder (str): Path to the folder containing ceiling height field .npy files.
+            grid_size (Tuple[int, int]): Number of rows and columns in the grid.
+            terrain_size (Tuple[float, float]): Size of each terrain piece (width, length).
+            ceiling_height (float): Height at which to place the ceiling terrain.
+
+        Returns:
+            None
+        """
+        # Import ground terrain
+        ground_mesh = self._import_height_field_folder(ground_folder, grid_size, terrain_size)
+
+        # Import ceiling terrain
+        ceiling_mesh = self._import_height_field_folder(ceiling_folder, grid_size, terrain_size)
+
+        # Move ceiling terrain to the specified height and invert it
+        ceiling_transform = np.eye(4)
+        ceiling_transform[2, 3] = ceiling_height
+        ceiling_transform[2, 2] = -1  # Invert the z-axis
+        ceiling_mesh.apply_transform(ceiling_transform)
+
+        # Combine ground and ceiling meshes
+        combined_mesh = trimesh.util.concatenate([ground_mesh, ceiling_mesh])
+
+        # Import the combined mesh
+        self.import_mesh("terrain", combined_mesh)
+
+
+
+        # Configure environment origins
+        num_envs = grid_size[0] * grid_size[1]
+        env_origins = torch.zeros((num_envs, 3), device=self.device)
+        for i in range(grid_size[0]):
+            for j in range(grid_size[1]):
+                env_index = i * grid_size[1] + j
+                env_origins[env_index, 0] = i * terrain_size[0] + terrain_size[0] / 2
+                env_origins[env_index, 1] = j * terrain_size[1] + terrain_size[1] / 2
+
+        self.env_origins = env_origins
+
+        # Configure environment origins
+        # self._configure_env_origins(grid_size, terrain_size)
+
+    def _import_height_field_folder(self, folder_path: str, grid_size: Tuple[int, int], terrain_size: Tuple[float, float]) -> trimesh.Trimesh:
+        """
+        Import height field .npy files from a folder, convert them to terrain meshes,
+        and arrange them in a grid.
+
+        Args:
+            folder_path (str): Path to the folder containing height field .npy files.
+            grid_size (Tuple[int, int]): Number of rows and columns in the grid.
+            terrain_size (Tuple[float, float]): Size of each terrain piece (width, length).
+
+        Returns:
+            trimesh.Trimesh: The combined mesh of all terrain pieces.
+        """
+        # ... (existing code from import_height_field_folder)
+        # Instead of importing the mesh, return the combined_mesh
+        # Get list of .npy files in the folder
+        height_field_files = [f for f in os.listdir(folder_path) if f.endswith('.npy')]
+        
+        if len(height_field_files) < grid_size[0] * grid_size[1]:
+            raise ValueError(f"Not enough height field files in {folder_path} to fill the grid.")
+
+        # Shuffle the files to randomize placement
+        np.random.shuffle(height_field_files)
+
+        # Create a grid of terrains
+        grid_terrains = []
+        for i in range(grid_size[0]):
+            for j in range(grid_size[1]):
+                file_index = i * grid_size[1] + j
+                height_field = np.load(os.path.join(folder_path, height_field_files[file_index]))
+                
+                # Convert height field to mesh
+                mesh = self._height_field_to_mesh(height_field, terrain_size)
+                
+                # Position the mesh in the grid
+                transform = np.eye(4)
+                transform[0, 3] = i * terrain_size[0]
+                transform[1, 3] = j * terrain_size[1]
+                mesh.apply_transform(transform)
+                
+                grid_terrains.append(mesh)
+
+        # Combine all meshes
+        combined_mesh = trimesh.util.concatenate(grid_terrains)
+        return combined_mesh
+
+    def _configure_env_origins(self, grid_size: Tuple[int, int], terrain_size: Tuple[float, float]):
+        """Configure environment origins for the constrained space."""
+        num_envs = grid_size[0] * grid_size[1]
+        env_origins = torch.zeros((num_envs, 3), device=self.device)
+        for i in range(grid_size[0]):
+            for j in range(grid_size[1]):
+                env_index = i * grid_size[1] + j
+                env_origins[env_index, 0] = i * terrain_size[0] + terrain_size[0] / 2
+                env_origins[env_index, 1] = j * terrain_size[1] + terrain_size[1] / 2
+
+        self.env_origins = env_origins
+        self.terrain_origins = env_origins.reshape(grid_size[0], grid_size[1], 3)
+
+
+    def delete_terrain(self, key: str):
+        """Delete an imported terrain.
+
+        This function removes the terrain from the simulator and cleans up associated data structures.
+
+        Args:
+            key: The key of the terrain to delete.
+
+        Raises:
+            KeyError: If the terrain with the given key does not exist.
+        """
+        # Check if the terrain exists
+        if key not in self.meshes:
+            raise KeyError(f"Terrain with key '{key}' does not exist.")
+
+        # Remove the terrain from the simulator
+        terrain_prim_path = f"{self.cfg.prim_path}/{key}"
+        prim_utils.delete_prim(terrain_prim_path)
+
+        # Remove the terrain from our data structures
+        del self.meshes[key]
+        del self.warp_meshes[key]
+
+        # If we're deleting the main terrain, reset related attributes
+        if key == "terrain":
+            self.terrain_origins = None
+            self.env_origins = None
+            self.terrain_levels = None
+            self.terrain_types = None
+            self._terrain_flat_patches = dict()
+
+        # Reset visualization if necessary
+        try:
+            if hasattr(self, "origin_visualizer"):
+                self.origin_visualizer.clear()
+                del self.origin_visualizer
+        except:
+            pass
+
+        print(f"Terrain '{key}' has been deleted.")
+
+    # def import_height_field_folder(self, folder_path: str, grid_size: Tuple[int, int], terrain_size: Tuple[float, float], env_spacing: float):
+    #     """
+    #     Import height field .npy files from a folder, convert them to terrain meshes,
+    #     and arrange them in a grid.
+
+    #     Args:
+    #         folder_path (str): Path to the folder containing height field .npy files.
+    #         grid_size (Tuple[int, int]): Number of rows and columns in the height field grid (e.g., (16, 16)).
+    #         terrain_size (Tuple[float, float]): Overall size of the terrain (e.g., (16.0, 4.0) or (32.0, 8.0)).
+    #         env_spacing (float): Spacing between environment origins.
+
+    #     Returns:
+    #         None
+    #     """
+    #     # Calculate the size of each terrain piece
+    #     piece_size = (terrain_size[0] / grid_size[0], terrain_size[1] / grid_size[1])
+
+    #     # Get list of .npy files in the folder
+    #     height_field_files = [f for f in os.listdir(folder_path) if f.endswith('.npy')]
+        
+    #     if len(height_field_files) < grid_size[0] * grid_size[1]:
+    #         raise ValueError(f"Not enough height field files in {folder_path} to fill the grid.")
+
+    #     # Shuffle the files to randomize placement
+    #     np.random.shuffle(height_field_files)
+
+    #     # Create a grid of terrains
+    #     grid_terrains = []
+    #     for i in range(grid_size[0]):
+    #         for j in range(grid_size[1]):
+    #             file_index = i * grid_size[1] + j
+    #             height_field = np.load(os.path.join(folder_path, height_field_files[file_index]))
+                
+    #             # Convert height field to mesh
+    #             mesh = self._height_field_to_mesh(height_field, piece_size)
+                
+    #             # Position the mesh in the grid
+    #             transform = np.eye(4)
+    #             transform[0, 3] = i * piece_size[0]
+    #             transform[1, 3] = j * piece_size[1]
+    #             mesh.apply_transform(transform)
+                
+    #             grid_terrains.append(mesh)
+
+    #     # Combine all meshes
+    #     ground_mesh = trimesh.util.concatenate(grid_terrains)
+
+    #     # Create ceiling mesh
+    #     ceiling_mesh = ground_mesh.copy()
+    #     ceiling_transform = np.eye(4)
+    #     ceiling_transform[2, 3] = 2.8
+    #     ceiling_transform[2, 2] = -1  # Invert the z-axis
+    #     ceiling_mesh.apply_transform(ceiling_transform)
+
+    #     # Combine ground and ceiling meshes
+    #     combined_mesh = trimesh.util.concatenate([ground_mesh, ceiling_mesh])
+
+    #     # Import the combined mesh
+    #     self.import_mesh("terrain", combined_mesh)
+
+    #     # Configure environment origins
+    #     num_envs = int((terrain_size[0] / env_spacing) * (terrain_size[1] / env_spacing))
+    #     env_origins = torch.zeros((num_envs, 3), device=self.device)
+        
+    #     env_grid_size = (int(terrain_size[0] / env_spacing), int(terrain_size[1] / env_spacing))
+    #     for i in range(env_grid_size[0]):
+    #         for j in range(env_grid_size[1]):
+    #             env_index = i * env_grid_size[1] + j
+    #             env_origins[env_index, 0] = i * env_spacing + env_spacing / 2
+    #             env_origins[env_index, 1] = j * env_spacing + env_spacing / 2
+
+    #     self.env_origins = env_origins
+    #     self.terrain_origins = env_origins.reshape(env_grid_size[0], env_grid_size[1], 3)
+
+    #     print(f"Terrain imported with size {terrain_size}, grid size {grid_size}, and {num_envs} environment origins.")
+
+    def import_height_field_folder(self, ground_folder: str, ceiling_folder: str, grid_size: Tuple[int, int], terrain_size: Tuple[float, float]):
+        """
+        Import height field .npy files from ground and ceiling folders, convert them to terrain meshes,
+        and arrange them in a grid.
+
+        Args:
+            ground_folder (str): Path to the folder containing ground height field .npy files.
+            ceiling_folder (str): Path to the folder containing ceiling height field .npy files.
+            grid_size (Tuple[int, int]): Number of rows and columns in the grid.
+            terrain_size (Tuple[float, float]): Size of each terrain piece (width, length).
+
+        Returns:
+            None
+        """
+        # Get list of .npy files in the ground folder
+        height_field_files = [f for f in os.listdir(ground_folder) if f.endswith('.npy')]
+        
+        if len(height_field_files) < grid_size[0] * grid_size[1]:
+            raise ValueError(f"Not enough height field files in {ground_folder} to fill the grid.")
+
+        horizontal_scale = 1.0
+        vertical_scale = 0.9
+        slope_threshold = 0.2
+
+        # Create a grid of ground terrains
+        grid_terrains = []
+        print(f"terrain size: {terrain_size}")
+        for i in range(grid_size[0]):
+            for j in range(grid_size[1]):
+                file_index = i * grid_size[1] + j
+                height_field = np.load(os.path.join(ground_folder, height_field_files[file_index]))
+                
+                # Convert height field to mesh
+                vertices, triangles  = convert_height_field_to_mesh(height_field, horizontal_scale, vertical_scale, slope_threshold)
+                mesh = trimesh.Trimesh(vertices=vertices, faces=triangles)
+                
+                # Position the mesh in the grid
+                transform = np.eye(4)
+                transform[0, 3] = i * terrain_size[0]
+                transform[1, 3] = j * terrain_size[1]
+                mesh.apply_transform(transform)
+                
+                grid_terrains.append(mesh)
+
+        # Combine all ground meshes
+        ground_mesh = trimesh.util.concatenate(grid_terrains)
+
+        # Get list of .npy files in the ceiling folder
+        ceiling_files = [f for f in os.listdir(ceiling_folder) if f.endswith('.npy')]
+        if len(ceiling_files) < grid_size[0] * grid_size[1]:
+            raise ValueError(f"Not enough height field files in {ceiling_folder} to fill the grid.")
+
+        # Create a grid of ceiling terrains
+        ceiling_grid_terrains = []
+        for i in range(grid_size[0]):
+            for j in range(grid_size[1]):
+                file_index = i * grid_size[1] + j
+                height_field = np.load(os.path.join(ceiling_folder, ceiling_files[file_index]))
+                
+                # Convert height field to mesh
+                vertices, triangles = convert_height_field_to_mesh(height_field, horizontal_scale, vertical_scale, slope_threshold)
+                mesh = trimesh.Trimesh(vertices=vertices, faces=triangles)
+                
+                # Position the mesh in the grid
+                transform = np.eye(4)
+                transform[0, 3] = i * terrain_size[0]
+                transform[1, 3] = j * terrain_size[1]
+                mesh.apply_transform(transform)
+
+                ceiling_grid_terrains.append(mesh)
+        
+        # Combine all ceiling meshes
+        ceiling_mesh = trimesh.util.concatenate(ceiling_grid_terrains)
+
+        # Invert the z-axis and raise the ceiling mesh
+        ceiling_transform = np.eye(4)
+        ceiling_transform[2, 3] = 0.7 #0.7
+        ceiling_transform[2, 2] = -1  # Invert the z-axis
+        ceiling_mesh.apply_transform(ceiling_transform)
+
+        # Import the ground and ceiling meshes
+        self.import_mesh("ground", ground_mesh)
+        self.import_mesh("ceiling", ceiling_mesh)
+        
+        # Configure environment origins
+        # terrain_size = (8,8)
+        num_envs = grid_size[0] * grid_size[1]
+        env_origins = torch.zeros((num_envs, 3), device=self.device)
+        for i in range(grid_size[0]):
+            for j in range(grid_size[1]):
+                env_index = i * grid_size[1] + j
+                env_origins[env_index, 0] = i * terrain_size[0] + terrain_size[0] / 2
+                env_origins[env_index, 1] = j * terrain_size[1] + terrain_size[1] / 2
+
+        self.env_origins = env_origins
+        self.terrain_origins = env_origins.reshape(grid_size[0], grid_size[1], 3)
+
+    def _height_field_to_mesh(self, height_field: np.ndarray, terrain_size: Tuple[float, float], base_height = -0.5) -> trimesh.Trimesh:
+        """
+        Convert a height field to a trimesh.
+
+        Args:
+            height_field (np.ndarray): 2D array representing the height field.
+            terrain_size (Tuple[float, float]): Size of the terrain (width, length).
+
+        Returns:
+            trimesh.Trimesh: The resulting mesh.
+        """
+        # rows, cols = height_field.shape
+        # vertices = []
+        # faces = []
+
+        # for i in range(rows):
+        #     for j in range(cols):
+        #         x = j * terrain_size[0] / (cols - 1)
+        #         y = i * terrain_size[1] / (rows - 1)
+        #         z = height_field[i, j]
+        #         vertices.append([x, y, z])
+
+        # vertices = np.array(vertices)
+
+        # for i in range(rows - 1):
+        #     for j in range(cols - 1):
+        #         v0 = i * cols + j
+        #         v1 = v0 + 1
+        #         v2 = (i + 1) * cols + j
+        #         v3 = v2 + 1
+        #         faces.extend([[v0, v2, v1], [v1, v2, v3]])
+
+        # faces = np.array(faces)
+
+        # mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+            
+        # # Calculate vertex normals
+        # mesh.vertex_normals
+
+
+        # return mesh
+    # Create top surface vertices
+        rows, cols = height_field.shape
+        vertices = []
+        faces = []
+        for i in range(rows):
+            for j in range(cols):
+                x = j * terrain_size[0] / (cols - 1)
+                y = i * terrain_size[1] / (rows - 1)
+                z = height_field[i, j]
+                vertices.append([x, y, z])
+
+        # Create bottom surface vertices
+        for i in range(rows):
+            for j in range(cols):
+                x = j * terrain_size[0] / (cols - 1)
+                y = i * terrain_size[1] / (rows - 1)
+                z = base_height
+                vertices.append([x, y, z])
+
+        vertices = np.array(vertices)
+
+        # Create top surface faces
+        for i in range(rows - 1):
+            for j in range(cols - 1):
+                v0 = i * cols + j
+                v1 = v0 + 1
+                v2 = (i + 1) * cols + j
+                v3 = v2 + 1
+                faces.extend([[v0, v2, v1], [v1, v2, v3]])
+
+        # Create bottom surface faces (inverted)
+        bottom_offset = rows * cols
+        for i in range(rows - 1):
+            for j in range(cols - 1):
+                v0 = bottom_offset + i * cols + j
+                v1 = v0 + 1
+                v2 = bottom_offset + (i + 1) * cols + j
+                v3 = v2 + 1
+                faces.extend([[v0, v1, v2], [v1, v3, v2]])
+
+        # Create side faces to connect top and bottom
+        for i in range(rows):
+            v_top = i * cols
+            v_bottom = bottom_offset + i * cols
+            v_top_next = ((i + 1) % rows) * cols
+            v_bottom_next = bottom_offset + ((i + 1) % rows) * cols
+            faces.extend([[v_top, v_bottom, v_top_next], [v_bottom, v_bottom_next, v_top_next]])
+
+        for j in range(cols):
+            v_top = j
+            v_bottom = bottom_offset + j
+            v_top_next = (j + 1) % cols
+            v_bottom_next = bottom_offset + (j + 1) % cols
+            faces.extend([[v_top, v_top_next, v_bottom], [v_top_next, v_bottom_next, v_bottom]])
+
+        faces = np.array(faces)
+
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+        
+        # Ensure consistent face winding and normals
+        mesh.fix_normals()
+
+        return mesh
+
+    def import_f1tenth_maps(self, map_folder: str, grid_size: Tuple[int, int], terrain_size: Tuple[float, float]):
+        """
+        Import F1TENTH map .npy files from a folder, convert them to terrain meshes,
+        and arrange them in a grid.
+
+        Args:
+            map_folder (str): Path to the folder containing F1TENTH map .npy files.
+            grid_size (Tuple[int, int]): Number of rows and columns in the grid.
+            terrain_size (Tuple[float, float]): Size of each terrain piece (width, length).
+
+        Returns:
+            None
+        """
+        # Get list of .npy files in the map folder
+        map_files = [f for f in os.listdir(map_folder) if f.endswith('.npy')]
+        
+        if len(map_files) < grid_size[0] * grid_size[1]:
+            raise ValueError(f"Not enough map files in {map_folder} to fill the grid.")
+
+        horizontal_scale = terrain_size[0] / 256  # Assuming 256x256 maps
+        vertical_scale = 0.1  # 10cm height scale
+
+        # Create a grid of terrains
+        grid_terrains = []
+        for i in range(grid_size[0]):
+            for j in range(grid_size[1]):
+                file_index = i * grid_size[1] + j
+                height_field = np.load(os.path.join(map_folder, map_files[file_index]))
+                
+                # Convert height field to mesh
+                mesh = height_field_to_mesh(height_field, horizontal_scale, vertical_scale)
+                
+                # Position the mesh in the grid
+                transform = np.eye(4)
+                transform[0, 3] = i * terrain_size[0]
+                transform[1, 3] = j * terrain_size[1]
+                mesh.apply_transform(transform)
+                
+                grid_terrains.append(mesh)
+
+        # Combine all meshes
+        combined_mesh = trimesh.util.concatenate(grid_terrains)
+
+        # Import the combined mesh
+        self.import_mesh("f1tenth_terrain", combined_mesh)
+        
+        # Configure environment origins
+        num_envs = grid_size[0] * grid_size[1]
+        env_origins = torch.zeros((num_envs, 3), device=self.device)
+        for i in range(grid_size[0]):
+            for j in range(grid_size[1]):
+                env_index = i * grid_size[1] + j
+                env_origins[env_index, 0] = i * terrain_size[0] + terrain_size[0] / 2
+                env_origins[env_index, 1] = j * terrain_size[1] + terrain_size[1] / 2
+
+        self.env_origins = env_origins
+        self.terrain_origins = env_origins.reshape(grid_size[0], grid_size[1], 3)

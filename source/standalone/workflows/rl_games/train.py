@@ -26,7 +26,7 @@ parser.add_argument(
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
 parser.add_argument("--sigma", type=str, default=None, help="The policy's initial standard deviation.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
-
+parser.add_argument("--play", action="store_true", help="Play the trained agent.")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -90,6 +90,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg["params"]["load_checkpoint"] = True
         agent_cfg["params"]["load_path"] = resume_path
         print(f"[INFO]: Loading model checkpoint from: {agent_cfg['params']['load_path']}")
+        
+        if args_cli.play:
+            print("[INFO]: Running in play mode.")
+            agent_cfg["params"]["config"]["play"] = True
+        else:
+            print("[INFO]: Running in training mode.")
+            agent_cfg["params"]["config"]["play"] = False
+
     train_sigma = float(args_cli.sigma) if args_cli.sigma is not None else None
 
     # multi-gpu training config
@@ -165,7 +173,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner.reset()
     # train the agent
     if args_cli.checkpoint is not None:
-        runner.run({"train": True, "play": False, "sigma": train_sigma, "checkpoint": resume_path})
+        runner.run({"train": not args_cli.play, "play": args_cli.play, "sigma": train_sigma, "checkpoint": resume_path})
     else:
         runner.run({"train": True, "play": False, "sigma": train_sigma})
 

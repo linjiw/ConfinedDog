@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import MISSING
-from typing import TYPE_CHECKING, Literal, Tuple
+from typing import TYPE_CHECKING, Literal
 
 import omni.isaac.lab.sim as sim_utils
 from omni.isaac.lab.utils import configclass
@@ -39,29 +39,11 @@ class TerrainImporterCfg:
     num_envs: int = MISSING
     """The number of environment origins to consider."""
 
-    terrain_type: Literal["generator", "usd", "plane", "height_field", "constrained_space", "f1tenth"] = "plane"
-    """The type of terrain to import. Defaults to "plane".
+    terrain_type: Literal["generator", "plane", "usd"] = "generator"
+    """The type of terrain to generate. Defaults to "generator".
 
-    Available options are "plane", "usd", "height_field", "constrained_space", and "f1tenth".
+    Available options are "plane", "usd", and "generator".
     """
-
-    ceiling_height: float | None = None
-    """The height of the ceiling. Required if terrain_type is 'constrained_space'."""
-
-    ground_folder: str | None = None
-    """The folder containing ground height field .npy files. Required if terrain_type is 'height_field'."""
-
-    ceiling_folder: str | None = None
-    """The folder containing ceiling height field .npy files. Required if terrain_type is 'height_field'."""
-
-    height_field_folder: str | None = None
-    """The folder containing height field .npy files. Required if terrain_type is 'height_field'."""
-
-    grid_size: Tuple[int, int] = (1, 1)
-    """The size of the grid for arranging terrains. Required if terrain_type is 'height_field'."""
-
-    terrain_size: Tuple[float, float] = (25.6, 25.6)
-    """The size of each terrain piece. Required if terrain_type is 'height_field'."""
 
     terrain_generator: TerrainGeneratorCfg | None = None
     """The terrain generator configuration.
@@ -115,6 +97,3 @@ class TerrainImporterCfg:
 
     debug_vis: bool = False
     """Whether to enable visualization of terrain origins for the terrain. Defaults to False."""
-
-    map_folder: str | None = None
-    """The folder containing F1TENTH map files (for 'f1tenth' terrain type)."""
