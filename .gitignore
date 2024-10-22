@@ -57,3 +57,12 @@ _build
 **/runs/*
 **/logs/*
 **/recordings/*
+
+# ignore folder name include test_height_fields_ceiling_* and test_height_fields_ground_*
+test_height_fields_ceiling_*/*.npy
+test_height_fields_ground_*/*.npy
+new_test_height_fields_ceiling/*.npy
+new_test_height_fields_ground/*.npy
+
+**/*.npy
+*.npy
